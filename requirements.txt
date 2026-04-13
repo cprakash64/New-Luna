@@ -1,0 +1,7 @@
+ultralytics
+opencv-python
+aiohttp
+google-genai
+pydantic
+dotenv
+numpy

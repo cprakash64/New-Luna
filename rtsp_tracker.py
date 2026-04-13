@@ -62,6 +62,10 @@ from ultralytics import YOLO
 from ultralytics.trackers import BYTETracker
 from ultralytics.utils import IterableSimpleNamespace
 
+# loading dotenv -- kaus added
+from dotenv import load_dotenv
+load_dotenv()
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
