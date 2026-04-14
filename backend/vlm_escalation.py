@@ -59,13 +59,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
-import json
 import logging
 import os
 import time
-import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable, Optional
+
+from slack_sdk import WebClient as SlackWebClient
 
 from google import genai
 from google.genai import types
@@ -99,8 +99,8 @@ class ViolationAnalysis(BaseModel):
     violation_type: str = Field(
         description=(
             "A concise label for the most significant violation observed, or 'None'. "
-            "Examples: 'No Hardhat', 'No Safety Vest', 'Carrying Heavy Load', "
-            "'Restricted Area Breach', 'Unsafe Posture', 'Blocked Emergency Exit'."
+            "Use exactly one of: 'No Hi-Vis Vest', 'Missing Hard Hat', "
+            "'Missing Multiple PPE', 'Vest Not Worn Properly', or 'None'."
         )
     )
     confidence_score: float = Field(
@@ -175,7 +175,7 @@ class GeminiConfig:
     location: str = "us-central1"
     model: str = "gemini-2.5-flash"
     temperature: float = 0.10           # low = deterministic safety judgements
-    max_output_tokens: int = 512        # extra headroom for reasoning field
+
     max_retries: int = 3
     retry_base_delay: float = 1.0       # seconds; doubles on each retry
 
@@ -220,30 +220,50 @@ class AnalysisResult:
 # ─── System prompt ────────────────────────────────────────────────────────────
 
 _ANALYSIS_PROMPT = """\
-You are an enterprise safety AI. Analyze this temporal 3×3 grid of frames \
-sequentially. Identify if any worker in the frame is NOT wearing a \
-high-visibility safety vest (orange or yellow). Return violation_detected: \
-true if a vest is missing, otherwise false. Be strict.
+You are an enterprise safety AI performing multi-modal reasoning on a \
+temporal 3×3 storyboard grid produced by a dual-model computer-vision \
+pipeline.
+
+Image pre-processing context (critical for correct interpretation):
+  • The faces of all workers have been blurred for privacy using a \
+Gaussian filter derived from facial landmark keypoints.  Do not flag \
+blurred face regions as anomalies.
+  • A 2-D skeletal pose overlay has been drawn over each worker using \
+17 COCO keypoints.  Limb lines are colour-coded: warm orange = left \
+side, blue = right side, green = collar and pelvis bars.  Use this \
+overlay to reason about body posture and joint alignment.
 
 Reading order: left-to-right, top-to-bottom.
   T1 (top-left) → earliest frame
   T9 (bottom-right) → most recent frame
 
-Decision rules:
-  1. Examine each frame T1–T9 in order.
-  2. For every visible worker, determine whether they are wearing a \
-high-visibility vest (orange or yellow).
-  3. Set violation_detected = true if ANY worker is clearly missing a hi-vis vest \
-across any frame in the sequence.
-  4. Set violation_type to "No Hi-Vis Vest" when a violation is found, \
-or "None" when every visible worker is correctly equipped.
-  5. Set confidence_score in [0.0, 1.0] reflecting your certainty.
-  6. Set reasoning to one or two sentences citing the specific frame numbers \
-(T1–T9) and visual evidence (clothing colour, worker position) that support \
-your conclusion.
+Review the provided image grid.  The faces have been blurred for \
+privacy, and a 2D skeletal pose is drawn over the workers.  Evaluate \
+the worker for comprehensive OSHA PPE compliance.  Specifically verify:
+  1. A high-visibility safety vest (use the skeleton to ensure it is \
+worn properly on the torso).
+  2. A hard hat / safety helmet worn on the head.
+  3. Safety eyewear (if image fidelity allows).
 
-Respond with a single valid JSON object — no markdown fence, no explanation, \
-no trailing text outside the JSON.
+If ANY of these items are missing or worn improperly, flag \
+violation_detected as true and detail exactly which pieces of equipment \
+are missing in the reasoning string.
+
+Set violation_type to exactly one of: "No Hi-Vis Vest" when only the \
+vest is absent or improperly worn; "Missing Hard Hat" when only the \
+hard hat is absent; "Missing Multiple PPE" when two or more items are \
+non-compliant; "Vest Not Worn Properly" when the vest is present but \
+structural pose analysis reveals it is held or draped rather than worn; \
+or "None" when every visible worker is fully compliant.
+Set confidence_score in [0.0, 1.0] reflecting your certainty across \
+the full temporal sequence.
+Set reasoning to one or two sentences citing the specific frame numbers \
+(T1–T9), the visual evidence (clothing colour, torso coverage, head \
+protection), and the skeletal joint evidence that support your \
+conclusion.
+
+Respond with a single valid JSON object — no markdown fence, no \
+explanation, no trailing text outside the JSON.
 """
 
 
@@ -473,7 +493,6 @@ class GeminiClient:
                         # Pydantic model so the model must emit valid structure.
                         response_schema=ViolationAnalysis,
                         temperature=self._cfg.temperature,
-                        max_output_tokens=self._cfg.max_output_tokens,
                     ),
                 )
                 # Double-validate through Pydantic to enforce custom validators
@@ -508,92 +527,90 @@ class GeminiAPIError(RuntimeError):
 _CAMERA_LOCATION = "Zone A - Packing Line"
 
 
-def _send_slack_alert(analysis: ViolationAnalysis, timestamp: str) -> None:
+def _send_slack_alert(
+    analysis: ViolationAnalysis,
+    timestamp: str,
+    track_id: int,
+    jpeg_bytes: bytes,
+) -> None:
     """
-    Construct a Block Kit payload and POST it to the Slack incoming-webhook.
+    Upload the storyboard image and violation details to Slack via the
+    Bot Token API (``slack_sdk.WebClient``).
 
     Execution model
     ───────────────
-    This function is synchronous and uses only stdlib ``urllib`` — no extra
-    dependencies are required.  It is always invoked via
-    ``asyncio.to_thread`` so the event loop is never blocked, even if Slack's
-    endpoint is slow or unreachable.
+    This function is fully synchronous (file I/O + blocking HTTP).  It is
+    always scheduled via ``asyncio.create_task(asyncio.to_thread(...))`` so
+    the upload never touches the event loop and cannot stall the tracking
+    pipeline, even on a slow network.
+
+    Image evidence
+    ──────────────
+    The storyboard JPEG is written to ``/tmp/violation_{track_id}.jpg``,
+    uploaded with ``files_upload_v2``, then deleted from disk regardless of
+    whether the upload succeeded or failed.
+
+    Required environment variables
+    ───────────────────────────────
+    ``SLACK_BOT_TOKEN``  — OAuth Bot Token (``xoxb-…``) with the
+                           ``files:write`` and ``chat:write`` scopes.
+    ``SLACK_CHANNEL``    — Channel ID or name to post into (e.g. ``C01AB2CD3``
+                           or ``#safety-alerts``).
 
     Failure handling
     ────────────────
-    Any network or HTTP error is caught and logged as a warning so a Slack
-    outage can never crash the VLM pipeline.  When ``SLACK_WEBHOOK_URL`` is
-    absent (e.g. a development machine) the function returns immediately
-    after logging a single warning.
+    Any SDK or I/O error is caught and logged as a warning so a Slack
+    outage can never crash the VLM pipeline.
     """
-    webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
-    if not webhook_url:
-        logger.warning("SLACK_WEBHOOK_URL not set — Slack alert skipped.")
+    bot_token = os.environ.get("SLACK_BOT_TOKEN")
+    channel   = os.environ.get("SLACK_CHANNEL")
+    if not bot_token or not channel:
+        logger.warning(
+            "SLACK_BOT_TOKEN or SLACK_CHANNEL not set — Slack alert skipped."
+        )
         return
 
-    payload = {
-        "blocks": [
-            {
-                "type": "header",
-                "text": {
-                    "type": "plain_text",
-                    "text": "🚨 Safety Violation Detected",
-                    "emoji": True,
-                },
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Camera Location:*\n{_CAMERA_LOCATION}",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Time:*\n{timestamp}",
-                    },
-                ],
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Violation Type:*\n{analysis.violation_type}",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Confidence:*\n{analysis.confidence_score:.0%}",
-                    },
-                ],
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Reasoning:*\n{analysis.reasoning}",
-                },
-            },
-            {"type": "divider"},
-        ]
-    }
-
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        webhook_url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    # ── Write storyboard to a temp file ──────────────────────────────────────
+    tmp_path = f"/tmp/violation_{track_id}.jpg"
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            logger.info(
-                "Slack alert sent (HTTP %d) for violation type '%s'.",
-                resp.status,
-                analysis.violation_type,
-            )
+        with open(tmp_path, "wb") as fh:
+            fh.write(jpeg_bytes)
+    except OSError as exc:
+        logger.warning("Could not write storyboard image to disk: %s", exc)
+        return
+
+    # ── Build the message text that accompanies the image ────────────────────
+    initial_comment = (
+        f"🚨 *Safety Violation Detected* — {_CAMERA_LOCATION}\n"
+        f"*Time:* {timestamp}  |  "
+        f"*Type:* {analysis.violation_type}  |  "
+        f"*Confidence:* {analysis.confidence_score:.0%}\n"
+        f"*Reasoning:* {analysis.reasoning}"
+    )
+
+    # ── Upload image + metadata in a single API call ──────────────────────────
+    client = SlackWebClient(token=bot_token)
+    try:
+        client.files_upload_v2(
+            channel=channel,
+            file=tmp_path,
+            filename=f"violation_{track_id}.jpg",
+            title=f"PPE Violation — {analysis.violation_type}",
+            initial_comment=initial_comment,
+        )
+        logger.info(
+            "Slack image alert uploaded for track ID %d (type='%s').",
+            track_id,
+            analysis.violation_type,
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Slack alert failed: %s", exc)
+        logger.warning("Slack upload failed: %s", exc)
+    finally:
+        # Always remove the temp file, whether the upload succeeded or not.
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 # ─── VLM Escalation Handler ───────────────────────────────────────────────────
@@ -677,17 +694,19 @@ class VLMEscalationHandler:
             analysis: ViolationAnalysis = await self._client.analyse(jpeg_bytes)
 
             # ── Slack alert (fire-and-forget) ─────────────────────────────────
-            # Scheduled as a concurrent Task so the HTTP POST to Slack never
-            # blocks AnalysisResult construction or the on_analysis dispatch.
-            # _send_slack_alert runs in a thread pool via asyncio.to_thread,
-            # keeping the event loop fully non-blocking.  All network errors
-            # are caught inside _send_slack_alert and demoted to warnings.
+            # Scheduled as a concurrent Task so the blocking file write +
+            # slack_sdk HTTP upload never stall the event loop.
+            # _send_slack_alert runs in a thread pool via asyncio.to_thread;
+            # all I/O and network errors are caught inside it and demoted to
+            # warnings so a Slack outage cannot crash the VLM pipeline.
             if analysis.violation_detected:
                 asyncio.create_task(
                     asyncio.to_thread(
                         _send_slack_alert,
                         analysis,
                         event.triggered_at_str,
+                        event.track_id,
+                        jpeg_bytes,
                     ),
                     name=f"slack-alert-{event.track_id}",
                 )

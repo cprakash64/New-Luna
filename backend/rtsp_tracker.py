@@ -62,10 +62,6 @@ from ultralytics import YOLO
 from ultralytics.trackers import BYTETracker
 from ultralytics.utils import IterableSimpleNamespace
 
-# loading dotenv -- kaus added
-from dotenv import load_dotenv
-load_dotenv()
-
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -93,7 +89,7 @@ class StreamConfig:
 class DetectorConfig:
     """YOLOv8 inference parameters."""
 
-    model_path: str = "yolov8s.pt"
+    model_path: str = "yolov8s-pose.pt"
     confidence: float = 0.40
     iou: float = 0.45
     device: str = "cpu"       # "cuda" | "mps" | "cpu"
@@ -173,12 +169,23 @@ class Detections:
     conf: np.ndarray  # (N,)    confidence in [0, 1]
     cls:  np.ndarray  # (N,)    integer class id
 
+    # ── Pose extension ────────────────────────────────────────────────────────
+    # Shape (N, 17, 3) — the 17 COCO skeleton keypoints per detection.
+    # Each row is [x_px, y_px, confidence].  The field defaults to an empty
+    # (0, 17, 3) sentinel so every caller that existed before pose support was
+    # added continues to work without modification: BYTETracker only reads
+    # .xyxy / .xywh / .conf / .cls and never touches this field.
+    keypoints: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 17, 3), dtype=np.float32)
+    )
+
     @classmethod
     def empty(cls) -> "Detections":
         return cls(
-            xyxy=np.empty((0, 4), dtype=np.float32),
-            conf=np.empty((0,),   dtype=np.float32),
-            cls =np.empty((0,),   dtype=np.float32),
+            xyxy=np.empty((0, 4),    dtype=np.float32),
+            conf=np.empty((0,),      dtype=np.float32),
+            cls =np.empty((0,),      dtype=np.float32),
+            keypoints=np.empty((0, 17, 3), dtype=np.float32),
         )
 
     @property
@@ -231,10 +238,19 @@ class Detections:
         where NumPy must materialise a new array (fancy indexing).  In either
         case the caller owns the result independently of this object.
         """
+        # Guard: only index into keypoints when the array is populated.
+        # The (0, 17, 3) empty sentinel produced by Detections.empty() has
+        # no rows, so applying an (N,)-shaped mask to it would raise a shape
+        # mismatch error.  This branch keeps BYTETracker's internal masking
+        # calls safe even when pose data is absent.
+        kp = self.keypoints
+        if kp.shape[0] > 0:
+            kp = kp[index]  # (N,17,3)[index] → (K,17,3)
         return Detections(
             xyxy=self.xyxy[index],  # (N,4)[index] → (K,4)
             conf=self.conf[index],  # (N,)[index]  → (K,)
             cls =self.cls[index],   # (N,)[index]  → (K,)
+            keypoints=kp,           # (K,17,3) or empty sentinel
         )
 
 
@@ -607,19 +623,54 @@ class PersonDetector:
 
     def detect(self, frame: np.ndarray) -> Detections:
         """
-        Run inference on *frame* and return person detections.
+        Run a single-pass inference on *frame* and return person detections
+        with pose data.
+
+        Multi-model data flow — Stage 1: Inference
+        ───────────────────────────────────────────
+        YOLOv8s-Pose runs a single forward pass on the full frame and jointly
+        predicts:
+          • Bounding boxes  → results[0].boxes   (used by BYTETracker)
+          • 17 COCO keypoints per person → results[0].keypoints
+            Shape: (N, 17, 3) where the last axis is [x_px, y_px, confidence].
+
+        COCO keypoint index map (used downstream for anonymisation / skeleton):
+          0  nose        1  left_eye    2  right_eye
+          3  left_ear    4  right_ear
+          5  left_shoulder   6  right_shoulder
+          7  left_elbow      8  right_elbow
+          9  left_wrist     10  right_wrist
+         11  left_hip       12  right_hip
+         13  left_knee      14  right_knee
+         15  left_ankle     16  right_ankle
 
         Returns:
-            ``Detections`` with arrays of shape (N, 4), (N,), (N,).
+            ``Detections`` with arrays of shape (N,4), (N,), (N,), (N,17,3).
         """
         results = self._infer(frame)
-        boxes = results[0].boxes
+        boxes   = results[0].boxes
         if boxes is None or len(boxes) == 0:
             return Detections.empty()
+
+        n = len(boxes)
+
+        # ── Extract keypoints ─────────────────────────────────────────────────
+        # results[0].keypoints.data is a tensor of shape (N, 17, 3).
+        # Fall back to an all-zeros array when the model returns no keypoint
+        # data (e.g. if a non-pose checkpoint is accidentally loaded).
+        kp_result = results[0].keypoints
+        if kp_result is not None and kp_result.data is not None and len(kp_result.data) > 0:
+            keypoints = kp_result.data.cpu().numpy().astype(np.float32)
+        else:
+            # Zero-filled sentinel: confidence channel = 0 means every
+            # downstream confidence gate will treat all keypoints as invisible.
+            keypoints = np.zeros((n, 17, 3), dtype=np.float32)
+
         return Detections(
             xyxy=boxes.xyxy.cpu().numpy().astype(np.float32),
             conf=boxes.conf.cpu().numpy().astype(np.float32),
             cls =boxes.cls.cpu().numpy().astype(np.float32),
+            keypoints=keypoints,
         )
 
 
@@ -1053,6 +1104,292 @@ def _annotate_and_show(
     cv2.imshow("RTSP Tracker", vis)
 
 
+# ─── Pose processing: anonymisation + skeletal annotation ────────────────────
+#
+# Multi-model data flow overview
+# ──────────────────────────────
+# Stage 1 — Inference   (PersonDetector.detect)
+#   YOLOv8s-Pose produces bounding boxes AND 17 COCO keypoints per person.
+#
+# Stage 2 — Anonymisation   (_apply_face_blur)
+#   Facial keypoints 0-4 (nose, eyes, ears) are used to mathematically infer
+#   a tight bounding box around the worker's face.  A heavy GaussianBlur is
+#   applied to that region IN-PLACE before the frame is pushed to the rolling
+#   FrameBuffer, ensuring that every JPEG snapshot sent to the VLM and stored
+#   in cloud telemetry is permanently anonymised at the source.
+#
+# Stage 3 — Annotation   (_draw_skeleton)
+#   Body keypoints 5-16 (shoulders through ankles) are connected by coloured
+#   limb lines to produce a 2-D skeletal overlay on the same frame.  This
+#   gives the VLM explicit structural information about joint alignment that
+#   would otherwise require it to interpret pixel-level clothing texture alone.
+#
+# Stage 4 — VLM Reasoning   (GeminiClient.analyse in vlm_escalation.py)
+#   The Gemini 2.5 Flash model receives the 3×3 storyboard grid of
+#   anonymised, skeleton-annotated frames and evaluates both vest presence
+#   (colour/texture) and vest fit (shoulder/torso joint alignment).
+#
+# The face-to-track association is performed via IoU matching between the
+# BYTETracker output bboxes and the original detection bboxes, because
+# BYTETracker does not expose the detection indices it consumed internally.
+
+# Indices of the five face keypoints in the COCO 17-point schema.
+_FACE_KP_IDX: list[int] = [0, 1, 2, 3, 4]  # nose, l_eye, r_eye, l_ear, r_ear
+
+# Minimum keypoint confidence to treat a joint as visible.
+_KP_CONF_THRESH: float = 0.30
+
+# Skeleton edge table: (from_kp_idx, to_kp_idx, BGR_colour).
+# Left-side limbs → warm orange | Right-side limbs → blue | Centre → green.
+_SKELETON_EDGES: list[tuple[int, int, tuple[int, int, int]]] = [
+    (5,  6,  (0,   220,  0)),   # L-shoulder  ↔  R-shoulder  (collar bar)
+    (5,  7,  (30,  140, 255)),  # L-shoulder  →  L-elbow
+    (7,  9,  (30,  140, 255)),  # L-elbow     →  L-wrist
+    (6,  8,  (255, 100,  30)),  # R-shoulder  →  R-elbow
+    (8,  10, (255, 100,  30)),  # R-elbow     →  R-wrist
+    (5,  11, (0,   220, 220)),  # L-shoulder  →  L-hip       (torso left)
+    (6,  12, (0,   220, 220)),  # R-shoulder  →  R-hip       (torso right)
+    (11, 12, (0,   220,  0)),   # L-hip       ↔  R-hip       (pelvis)
+    (11, 13, (60,  220, 220)),  # L-hip       →  L-knee
+    (13, 15, (60,  220, 220)),  # L-knee      →  L-ankle
+    (12, 14, (220, 180,  60)),  # R-hip       →  R-knee
+    (14, 16, (220, 180,  60)),  # R-knee      →  R-ankle
+]
+
+
+def _infer_face_bbox(
+    kpts: np.ndarray,
+    frame_h: int,
+    frame_w: int,
+    conf_thresh: float = 0.20,
+    pad_frac_x: float = 0.65,
+    pad_frac_y_up: float = 0.10,
+    pad_frac_y_down: float = 0.65,
+) -> Optional[tuple[int, int, int, int]]:
+    """
+    Derive a face bounding box from COCO keypoints 0-4 (nose + eyes + ears).
+
+    Asymmetric vertical padding
+    ───────────────────────────
+    The COCO face keypoints cluster around the eyes, nose, and ears.
+    ``y_min`` therefore lands at approximately eye level — the forehead and
+    any PPE worn on top of the head (hard hats, bump caps) sit *above* that
+    line.
+
+    To keep hard-hat crowns fully visible to the VLM:
+
+    • ``pad_frac_y_up``   (default 0.10) — tiny upward expansion, just enough
+      to cover the eyebrows which sit fractionally above the eye keypoints.
+      This deliberately stops well short of the forehead so no upward PPE is
+      ever blurred.
+
+    • ``pad_frac_y_down`` (default 0.65) — generous downward expansion toward
+      the chin; the mouth and jaw sit below all five keypoints, so this pad
+      is still needed for complete facial anonymisation.
+
+    • ``pad_frac_x``      (default 0.65) — symmetric horizontal expansion
+      from ear to ear to cover cheeks and temples.
+
+    All fractions are proportional to the tight keypoint span so the blur
+    region scales naturally with subject distance from the camera.
+
+    Args:
+        kpts:            (17, 3) float32 array [x, y, confidence].
+        frame_h/w:       Frame dimensions used to clamp the box in-bounds.
+        conf_thresh:     Minimum keypoint confidence to include in the fit.
+        pad_frac_x:      Fractional horizontal outward expansion.
+        pad_frac_y_up:   Fractional upward expansion (eyebrows only).
+        pad_frac_y_down: Fractional downward expansion (chin coverage).
+
+    Returns:
+        (x1, y1, x2, y2) integer pixel coords clamped to the frame, or
+        None when fewer than 2 face keypoints are visible.
+    """
+    # Isolate the five face keypoints and keep only high-confidence ones.
+    face_kpts = kpts[_FACE_KP_IDX]          # shape (5, 3)
+    visible   = face_kpts[face_kpts[:, 2] > conf_thresh]
+
+    # Need at least two visible face keypoints to form a meaningful box.
+    if len(visible) < 2:
+        return None
+
+    x_min, y_min = float(visible[:, 0].min()), float(visible[:, 1].min())
+    x_max, y_max = float(visible[:, 0].max()), float(visible[:, 1].max())
+
+    # Use the tighter of width/height as the reference span for each axis so
+    # the padding stays proportional regardless of viewing angle.
+    span_x = max(x_max - x_min, 1.0)
+    span_y = max(y_max - y_min, 1.0)
+
+    pad_x    = span_x * pad_frac_x
+    pad_up   = span_y * pad_frac_y_up    # small — eyebrows only, hard hat safe
+    pad_down = span_y * pad_frac_y_down  # generous — reaches chin/jaw
+
+    x1 = int(max(0,           x_min - pad_x))
+    y1 = int(max(0,           y_min - pad_up))    # top edge stays near eye level
+    x2 = int(min(frame_w - 1, x_max + pad_x))
+    y2 = int(min(frame_h - 1, y_max + pad_down))  # bottom edge covers chin
+
+    # Degenerate box guard (can occur when all keypoints overlap exactly).
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _apply_face_blur(frame: np.ndarray, kpts: np.ndarray) -> None:
+    """
+    Permanently anonymise the worker's face in *frame* using GaussianBlur.
+
+    Multi-model data flow — Stage 2: Anonymisation
+    ───────────────────────────────────────────────
+    Called IN-PLACE before the frame is pushed to the FrameBuffer so that
+    every downstream consumer — JPEG extraction, Storyboard builder, VLM,
+    cloud storage — only ever receives the anonymised version.
+
+    The Gaussian kernel size is derived from the face bounding-box dimensions
+    and forced to an odd integer (required by OpenCV) so the blur intensity
+    scales with subject proximity rather than being a fixed pixel count.
+
+    Args:
+        frame: BGR frame to modify in-place.
+        kpts:  (17, 3) keypoint array for a single tracked person.
+    """
+    h, w = frame.shape[:2]
+    face_bbox = _infer_face_bbox(kpts, h, w)
+    if face_bbox is None:
+        # No reliable face keypoints detected — skip rather than guess.
+        return
+
+    x1, y1, x2, y2 = face_bbox
+    face_roi = frame[y1:y2, x1:x2]
+
+    # Kernel must be odd and at least 21 px for a visually heavy blur that
+    # cannot be reversed by simple deconvolution.
+    bw, bh  = x2 - x1, y2 - y1
+    k_size  = max(21, int(max(bw, bh) * 0.35))
+    k_size  = k_size if k_size % 2 == 1 else k_size + 1  # force odd
+
+    # Write the blurred region back into the frame in-place.
+    frame[y1:y2, x1:x2] = cv2.GaussianBlur(face_roi, (k_size, k_size), 0)
+
+
+def _draw_skeleton(frame: np.ndarray, kpts: np.ndarray) -> None:
+    """
+    Draw a high-contrast 2-D skeletal overlay for body joints 5-16.
+
+    Multi-model data flow — Stage 3: Annotation
+    ────────────────────────────────────────────
+    Limb lines and joint dots are drawn only when BOTH endpoints have a
+    confidence score above _KP_CONF_THRESH, preventing spurious lines from
+    low-confidence predictions.
+
+    Face keypoints (0-4) are intentionally skipped because that region has
+    already been blurred by the anonymisation layer; drawing landmarks on a
+    blurred region would provide no useful information to the VLM.
+
+    The colour coding follows the _SKELETON_EDGES table:
+      • Warm orange  — left-side limbs (from the subject's perspective)
+      • Blue         — right-side limbs
+      • Bright green — collar bar and pelvis (central axis)
+
+    Args:
+        frame: BGR frame to annotate in-place.
+        kpts:  (17, 3) keypoint array for a single tracked person.
+    """
+    # ── Limb lines ────────────────────────────────────────────────────────────
+    for idx_a, idx_b, colour in _SKELETON_EDGES:
+        xa, ya, ca = kpts[idx_a]
+        xb, yb, cb = kpts[idx_b]
+        # Skip this limb if either endpoint is below the confidence threshold.
+        if ca < _KP_CONF_THRESH or cb < _KP_CONF_THRESH:
+            continue
+        cv2.line(
+            frame,
+            (int(xa), int(ya)),
+            (int(xb), int(yb)),
+            colour, 2, cv2.LINE_AA,
+        )
+
+    # ── Joint dots (body only; face joints omitted — already blurred) ─────────
+    for idx in range(5, 17):
+        x, y, c = kpts[idx]
+        if c < _KP_CONF_THRESH:
+            continue
+        pt = (int(x), int(y))
+        # White-filled circle with a thin dark outline for visibility on any
+        # background colour.
+        cv2.circle(frame, pt, 4, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, pt, 4, (30,   30,  30),  1, cv2.LINE_AA)
+
+
+def _iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    """
+    Compute Intersection-over-Union for two [x1, y1, x2, y2] boxes.
+
+    Used exclusively by _map_track_keypoints to re-associate BYTETracker
+    output bboxes with the detection keypoints that spawned them.
+    """
+    ix1 = max(box_a[0], box_b[0])
+    iy1 = max(box_a[1], box_b[1])
+    ix2 = min(box_a[2], box_b[2])
+    iy2 = min(box_a[3], box_b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter == 0.0:
+        return 0.0
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union  = area_a + area_b - inter
+    return inter / union if union > 0.0 else 0.0
+
+
+def _map_track_keypoints(
+    active_tracks: list[tuple[int, np.ndarray]],
+    detections: Detections,
+    iou_threshold: float = 0.30,
+) -> dict[int, np.ndarray]:
+    """
+    Re-associate BYTETracker track bboxes with per-detection keypoints.
+
+    BYTETracker does not expose the detection indices it consumed, so this
+    function greedily matches each track's bbox to the detection with the
+    highest IoU.  Tracks with no match above iou_threshold are omitted from
+    the returned dict, meaning anonymisation and skeleton drawing will simply
+    be skipped for that individual on this frame.
+
+    Args:
+        active_tracks: List of (track_id, [x1,y1,x2,y2]) from PersonTracker.
+        detections:    The Detections object that was passed to the tracker
+                       this frame, carrying the (N, 17, 3) keypoints array.
+        iou_threshold: Minimum IoU to accept a detection as the match for a
+                       given track; prevents false associations when detections
+                       are close together.
+
+    Returns:
+        {track_id: keypoints (17, 3)} for every successfully matched track.
+    """
+    kp_map: dict[int, np.ndarray] = {}
+
+    # Early exit when no pose data is available (e.g. fallback to plain bbox
+    # model) to avoid unnecessary inner-loop work.
+    if len(detections) == 0 or detections.keypoints.shape[0] == 0:
+        return kp_map
+
+    for track_id, track_bbox in active_tracks:
+        best_iou:  float              = iou_threshold
+        best_kpts: Optional[np.ndarray] = None
+
+        for det_idx in range(len(detections)):
+            score = _iou(track_bbox, detections.xyxy[det_idx])
+            if score > best_iou:
+                best_iou  = score
+                best_kpts = detections.keypoints[det_idx]  # (17, 3)
+
+        if best_kpts is not None:
+            kp_map[track_id] = best_kpts
+
+    return kp_map
+
+
 # ─── Main pipeline ────────────────────────────────────────────────────────────
 
 
@@ -1067,18 +1404,25 @@ def run(
     """
     Wire together all subsystems into a single real-time inference loop.
 
-    Per-frame execution order
-    ─────────────────────────
-    1. Acquire latest frame from FrameReader queue (blocks up to 2 s).
-    2. Push frame to FrameBuffer (rolling window for event snapshots).
-    3. Run YOLOv8 person detection.
-    4. Update ByteTrack; receive active (track_id, bbox) pairs.
-    5. Update EntityRegistry: recompute ROI membership and dwell counters.
-    6. For each entity, call EventManager.maybe_trigger() (synchronous check;
-       async JPEG work is scheduled if triggered).
-    7. Prune stale entities.
-    8. Compute FPS; print console status line.
-    9. (Optional) Render annotated frame.
+    Per-frame execution order (multi-model architecture)
+    ─────────────────────────────────────────────────────
+    1.  Acquire latest frame from FrameReader queue (blocks up to 2 s).
+    2.  Run YOLOv8s-Pose: joint bbox + 17-keypoint inference  [Stage 1]
+    3.  Update ByteTrack; receive active (track_id, bbox) pairs.
+    4.  Re-associate track bboxes → detection keypoints via IoU matching.
+    5.  Anonymisation layer: for every tracked person, infer a face bbox
+        from keypoints 0-4 and apply GaussianBlur in-place.         [Stage 2]
+    6.  Pose layer: draw 2-D skeletal overlay (joints 5-16) on the same
+        processed frame.                                             [Stage 3]
+    7.  Push the anonymised + skeleton-annotated frame to FrameBuffer.
+        All downstream consumers (JPEG extractor, Storyboard, VLM, cloud
+        storage) receive only this privacy-safe version.
+    8.  Update EntityRegistry: recompute ROI membership and dwell counters.
+    9.  For each entity, call EventManager.maybe_trigger() (synchronous
+        check; async JPEG work is scheduled if triggered).
+    10. Prune stale entities.
+    11. Compute FPS; print console status line.
+    12. (Optional) Render bounding boxes + ROI overlay on processed frame.
     """
     reader    = FrameReader(stream_cfg).start()
     detector  = PersonDetector(detector_cfg)
@@ -1106,17 +1450,45 @@ def run(
 
             now = time.time()
 
-            # ── 1. Buffer ─────────────────────────────────────────────────────
-            buf.push(frame)
-
-            # ── 2. Detect ─────────────────────────────────────────────────────
+            # ── 1. Detect (Stage 1 — YOLOv8s-Pose inference) ─────────────────
+            # Produces bounding boxes AND (N, 17, 3) keypoint arrays in one
+            # forward pass.  The raw frame is never stored in the buffer so
+            # un-anonymised faces never reach any downstream consumer.
             detections = detector.detect(frame)
 
-            # ── 3. Track ──────────────────────────────────────────────────────
+            # ── 2. Track ──────────────────────────────────────────────────────
             active_tracks = tracker.update(detections, frame)
             active_ids = {tid for tid, _ in active_tracks}
 
-            # ── 4. Update entity states ───────────────────────────────────────
+            # ── 3. Associate keypoints → tracks via IoU ───────────────────────
+            # BYTETracker returns (track_id, bbox) pairs without carrying the
+            # originating detection indices.  _map_track_keypoints greedy-
+            # matches each track bbox to the highest-IoU detection so we can
+            # look up that person's 17 keypoints by track ID.
+            kp_map = _map_track_keypoints(active_tracks, detections)
+
+            # ── 4. Anonymisation + Pose annotation (Stages 2 & 3) ────────────
+            # Work on a copy so the raw frame is never modified or buffered.
+            # Face blur is applied first (in-place on proc_frame) so the
+            # skeleton draw that follows never re-exposes facial landmarks.
+            proc_frame = frame.copy()
+            for track_id, _bbox in active_tracks:
+                kpts = kp_map.get(track_id)
+                if kpts is not None:
+                    # Stage 2 — Anonymisation: blur face region derived from
+                    # nose / eye / ear keypoints (COCO indices 0-4).
+                    _apply_face_blur(proc_frame, kpts)
+                    # Stage 3 — Pose annotation: draw coloured limb lines and
+                    # joint dots for body keypoints (COCO indices 5-16).
+                    _draw_skeleton(proc_frame, kpts)
+
+            # ── 5. Buffer (anonymised + annotated frame only) ─────────────────
+            # Every JPEG snapshot extracted by EventManager._encode_jpegs,
+            # every Storyboard grid cell, and every image uploaded to cloud
+            # storage will contain this privacy-safe, skeleton-annotated frame.
+            buf.push(proc_frame)
+
+            # ── 6. Update entity states ───────────────────────────────────────
             registry.update(active_tracks, roi, now)
 
             # ── 5. Evaluate event conditions ──────────────────────────────────
@@ -1148,8 +1520,11 @@ def run(
             )
 
             # ── 8. Optional display ───────────────────────────────────────────
+            # proc_frame already carries the face blur and skeleton overlay;
+            # _annotate_and_show adds bounding boxes and the ROI polygon on
+            # top of that for the live monitor window only.
             if display:
-                _annotate_and_show(frame, active_tracks, fps, roi, registry)
+                _annotate_and_show(proc_frame, active_tracks, fps, roi, registry)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
@@ -1335,19 +1710,28 @@ if __name__ == "__main__":
             on_analysis=print_vlm_verdict,
         )
 
-        _TEST_VIDEO = (
-            "/Users/cprakash/Documents/MY_AI/Luna_V2/"
-            "Luna_V2_Test_Video/faststart_factory_cam.mp4"
-        )
+        # ── Video Selection ──
+        _VIDEO_DIR = "/Users/cprakash/Documents/MY_AI/Luna_V2/Luna_V2_Test_Video/"
+        
+        _TEST_VIDEOS = [
+            _VIDEO_DIR + "Video1.mp4",  # Index 0
+            _VIDEO_DIR + "Video2.mp4",  # Index 1
+            _VIDEO_DIR + "Video3.mp4",  # Index 2
+        ]
+        
+        # Change this index (0, 1, or 2) to swap test videos
+        _CURRENT_VIDEO = _TEST_VIDEOS[1] 
+        
+        print(f"\n--- LOADING VIDEO: {_CURRENT_VIDEO} ---\n")
+
         run(
-            stream_cfg=StreamConfig(rtsp_url=_TEST_VIDEO),
+            stream_cfg=StreamConfig(rtsp_url=_CURRENT_VIDEO), # <-- Make sure this says _CURRENT_VIDEO
             detector_cfg=DetectorConfig(),
             tracker_cfg=TrackerConfig(),
-            # ROI expanded to cover almost the entire 1920×1080 frame so that
-            # any detected person immediately starts accumulating dwell frames,
-            # forcing an event trigger for Phase 3 VLM testing.
             event_cfg=EventConfig(
-                roi_polygon=[(320, 180), (960, 180), (960, 540), (320, 540)],
+                roi_polygon=[(0, 0), (1920, 0), (1920, 1080), (0, 1080)],
+                dwell_frames=5,
+                snapshot_count=5,
             ),
             on_event=_vlm_handler,
             display=True,
