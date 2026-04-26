@@ -63,7 +63,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 from slack_sdk import WebClient as SlackWebClient
 
@@ -71,7 +71,7 @@ from google import genai
 from google.genai import types
 import cv2
 import numpy as np
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, create_model, field_validator
 
 # rtsp_tracker is imported for the Event type only; no circular dependency
 # because rtsp_tracker never imports from this module.
@@ -96,12 +96,12 @@ class ViolationAnalysis(BaseModel):
     violation_detected: bool = Field(
         description="True when a safety violation is present in the storyboard."
     )
+    # Base-class description is deliberately generic.  The concrete schema
+    # used for each Gemini call is built by ``_build_violation_schema`` and
+    # narrows both the type (Literal[...]) and the description to the
+    # ``active_rules`` for that specific camera.
     violation_type: str = Field(
-        description=(
-            "A concise label for the most significant violation observed, or 'None'. "
-            "Use exactly one of: 'No Hi-Vis Vest', 'Missing Hard Hat', "
-            "'Missing Multiple PPE', 'Vest Not Worn Properly', or 'None'."
-        )
+        description="A concise label for the most significant violation observed, or 'None'."
     )
     confidence_score: float = Field(
         ge=0.0,
@@ -217,54 +217,191 @@ class AnalysisResult:
         )
 
 
-# ─── System prompt ────────────────────────────────────────────────────────────
+# ─── Dynamic system prompt + schema (rule-scoped) ─────────────────────────────
+#
+# The factory manager configures each camera with an ``active_rules`` list in
+# Supabase (e.g. ["hardhat", "vest"]).  Only those rules are flagged as
+# violations; every other PPE category MUST be ignored — both to match
+# customer intent and to prevent Gemini from hallucinating safety issues the
+# site does not care about.
+#
+# For every escalation we rebuild:
+#   1. The natural-language prompt — active rules get strict CHECK instructions,
+#      inactive rules get explicit IGNORE instructions.
+#   2. The Pydantic response_schema — ``violation_type`` is narrowed to a
+#      ``Literal`` of just the labels that correspond to the active rules
+#      (plus ``"None"``), and the field description enumerates that exact set.
 
-_ANALYSIS_PROMPT = """\
-You are an enterprise safety AI performing multi-modal reasoning on a \
-temporal 3×3 storyboard grid produced by a dual-model computer-vision \
-pipeline.
+# Per-rule prompt + label metadata.  Extend this table to onboard new PPE
+# categories without touching the prompt assembler.
+_RULE_SPECS: dict[str, dict] = {
+    "hardhat": {
+        "active_instruction": (
+            "HARD HAT (ACTIVE RULE): You MUST verify that every visible worker "
+            "is wearing a hard hat / safety helmet on the head.  Use the "
+            "skeletal overlay's nose/ear keypoints (which anchor the head "
+            "location even though the face pixels are blurred) to locate the "
+            "head region, then inspect the pixels immediately above it for "
+            "helmet geometry and colour.  If the head region is bare, "
+            "flag 'Missing Hard Hat'."
+        ),
+        "ignore_instruction": (
+            "HARD HAT (INACTIVE): Do NOT flag missing or absent hard hats.  "
+            "Ignore head-protection status entirely — this site is not "
+            "enforcing hard hat compliance."
+        ),
+        "violation_labels": ["Missing Hard Hat"],
+    },
+    "vest": {
+        "active_instruction": (
+            "HI-VIS VEST (ACTIVE RULE): You MUST verify that every visible "
+            "worker is wearing a high-visibility safety vest properly on the "
+            "torso.  Use the skeletal overlay's shoulder (5, 6), hip (11, 12) "
+            "and collar bar to define the torso region, then check whether "
+            "that region is covered by a bright hi-vis garment.  If the vest "
+            "is absent flag 'No Hi-Vis Vest'; if it is present but the "
+            "skeletal geometry shows it draped, held, or hanging off one "
+            "shoulder rather than worn, flag 'Vest Not Worn Properly'."
+        ),
+        "ignore_instruction": (
+            "HI-VIS VEST (INACTIVE): Do NOT flag missing, absent, or "
+            "improperly worn hi-vis vests.  Ignore torso-garment status "
+            "entirely — this site is not enforcing vest compliance."
+        ),
+        "violation_labels": ["No Hi-Vis Vest", "Vest Not Worn Properly"],
+    },
+}
 
-Image pre-processing context (critical for correct interpretation):
-  • The faces of all workers have been blurred for privacy using a \
-Gaussian filter derived from facial landmark keypoints.  Do not flag \
-blurred face regions as anomalies.
-  • A 2-D skeletal pose overlay has been drawn over each worker using \
-17 COCO keypoints.  Limb lines are colour-coded: warm orange = left \
-side, blue = right side, green = collar and pelvis bars.  Use this \
-overlay to reason about body posture and joint alignment.
 
-Reading order: left-to-right, top-to-bottom.
-  T1 (top-left) → earliest frame
-  T9 (bottom-right) → most recent frame
+def _allowed_violation_types(active_rules: list[str]) -> list[str]:
+    """
+    Return the ordered list of labels the model is allowed to emit for
+    ``violation_type``.  Always includes ``"None"``.  If two or more rules
+    are active, ``"Missing Multiple PPE"`` is also allowed.
+    """
+    allowed: list[str] = ["None"]
+    normalised = [r.lower() for r in active_rules]
+    for rule in normalised:
+        spec = _RULE_SPECS.get(rule)
+        if spec is None:
+            continue
+        for label in spec["violation_labels"]:
+            if label not in allowed:
+                allowed.append(label)
+    if len(normalised) >= 2:
+        allowed.append("Missing Multiple PPE")
+    return allowed
 
-Review the provided image grid.  The faces have been blurred for \
-privacy, and a 2D skeletal pose is drawn over the workers.  Evaluate \
-the worker for comprehensive OSHA PPE compliance.  Specifically verify:
-  1. A high-visibility safety vest (use the skeleton to ensure it is \
-worn properly on the torso).
-  2. A hard hat / safety helmet worn on the head.
-  3. Safety eyewear (if image fidelity allows).
 
-If ANY of these items are missing or worn improperly, flag \
-violation_detected as true and detail exactly which pieces of equipment \
-are missing in the reasoning string.
+def _build_prompt(active_rules: list[str]) -> str:
+    """
+    Assemble the Gemini system prompt for the given ``active_rules``.
 
-Set violation_type to exactly one of: "No Hi-Vis Vest" when only the \
-vest is absent or improperly worn; "Missing Hard Hat" when only the \
-hard hat is absent; "Missing Multiple PPE" when two or more items are \
-non-compliant; "Vest Not Worn Properly" when the vest is present but \
-structural pose analysis reveals it is held or draped rather than worn; \
-or "None" when every visible worker is fully compliant.
-Set confidence_score in [0.0, 1.0] reflecting your certainty across \
-the full temporal sequence.
-Set reasoning to one or two sentences citing the specific frame numbers \
-(T1–T9), the visual evidence (clothing colour, torso coverage, head \
-protection), and the skeletal joint evidence that support your \
-conclusion.
+    Active rules get strict CHECK blocks; inactive rules get explicit IGNORE
+    blocks so Gemini cannot invent violations outside the customer's scope.
+    """
+    normalised = [r.lower() for r in active_rules]
+    active_blocks: list[str] = []
+    ignore_blocks: list[str] = []
+    for rule, spec in _RULE_SPECS.items():
+        if rule in normalised:
+            active_blocks.append(f"  • {spec['active_instruction']}")
+        else:
+            ignore_blocks.append(f"  • {spec['ignore_instruction']}")
 
-Respond with a single valid JSON object — no markdown fence, no \
-explanation, no trailing text outside the JSON.
-"""
+    if active_blocks:
+        checks_section = (
+            "Compliance checks for THIS camera (only these matter):\n"
+            + "\n".join(active_blocks)
+        )
+    else:
+        checks_section = (
+            "Compliance checks for THIS camera: NONE configured.  Treat every "
+            "worker as compliant and set violation_detected=false."
+        )
+
+    ignore_section = (
+        "Rules that are NOT active for this camera — you MUST ignore them:\n"
+        + "\n".join(ignore_blocks)
+    ) if ignore_blocks else ""
+
+    allowed = _allowed_violation_types(active_rules)
+    allowed_str = ", ".join(f'"{t}"' for t in allowed)
+
+    multi_clause = (
+        f' Use "Missing Multiple PPE" only when two or more ACTIVE rules '
+        f'are simultaneously violated.'
+        if "Missing Multiple PPE" in allowed else ""
+    )
+
+    parts = [
+        "You are an enterprise safety AI performing multi-modal reasoning on a "
+        "temporal 3×3 storyboard grid produced by a dual-model computer-vision "
+        "pipeline.",
+        "",
+        "Image pre-processing context (critical for correct interpretation):",
+        "  • The faces of all workers have been blurred for privacy using a "
+        "Gaussian filter derived from facial landmark keypoints.  Do not flag "
+        "blurred face regions as anomalies.",
+        "  • A 2-D skeletal pose overlay has been drawn over each worker using "
+        "17 COCO keypoints.  Limb lines are colour-coded: warm orange = left "
+        "side, blue = right side, green = collar and pelvis bars.  Use this "
+        "overlay to reason about body posture and joint alignment.",
+        "",
+        "Reading order: left-to-right, top-to-bottom.",
+        "  T1 (top-left) → earliest frame",
+        "  T9 (bottom-right) → most recent frame",
+        "",
+        checks_section,
+    ]
+    if ignore_section:
+        parts.extend(["", ignore_section])
+
+    parts.extend([
+        "",
+        "If and ONLY IF one of the active rules above is violated, set "
+        "violation_detected=true and detail which rule(s) failed in the "
+        "reasoning string.  Never flag a violation that falls outside the "
+        "active rule list.",
+        "",
+        f"Set violation_type to EXACTLY one of: {allowed_str}.{multi_clause} "
+        "Any other string is forbidden.",
+        "Set confidence_score in [0.0, 1.0] reflecting your certainty across "
+        "the full temporal sequence.",
+        "Set reasoning to one or two sentences citing the specific frame "
+        "numbers (T1–T9), the visual evidence, and the skeletal joint "
+        "evidence that support your conclusion.",
+        "",
+        "Respond with a single valid JSON object — no markdown fence, no "
+        "explanation, no trailing text outside the JSON.",
+    ])
+    return "\n".join(parts)
+
+
+def _build_violation_schema(active_rules: list[str]) -> type[ViolationAnalysis]:
+    """
+    Build a subclass of ``ViolationAnalysis`` whose ``violation_type`` is a
+    ``Literal`` over exactly the labels corresponding to ``active_rules``.
+
+    Using ``pydantic.create_model`` (rather than class-body annotations)
+    matters here because the module uses ``from __future__ import annotations``
+    — class-body annotations would be captured as strings and the closed-over
+    ``allowed`` list would not survive ``get_type_hints`` resolution.
+    """
+    allowed = _allowed_violation_types(active_rules)
+    # Literal accepts a tuple; this is equivalent to Literal[allowed[0], allowed[1], ...].
+    literal_type = Literal[tuple(allowed)]  # type: ignore[valid-type]
+    description = (
+        "A concise label for the most significant violation observed, or "
+        f"'None'. Use EXACTLY one of: {', '.join(repr(t) for t in allowed)}. "
+        "Any other label is forbidden."
+    )
+
+    return create_model(  # type: ignore[call-overload]
+        "ViolationAnalysisScoped",
+        __base__=ViolationAnalysis,
+        violation_type=(literal_type, Field(description=description)),
+    )
 
 
 # ─── Temporal storyboard builder ─────────────────────────────────────────────
@@ -462,16 +599,26 @@ class GeminiClient:
 
     # ── Public ────────────────────────────────────────────────────────────────
 
-    async def analyse(self, jpeg_bytes: bytes) -> ViolationAnalysis:
+    async def analyse(
+        self,
+        jpeg_bytes: bytes,
+        active_rules: list[str],
+    ) -> ViolationAnalysis:
         """
         Send the storyboard JPEG to Gemini and return a validated
-        ``ViolationAnalysis``.
+        ``ViolationAnalysis`` scoped to ``active_rules``.
 
         Args:
-            jpeg_bytes: Raw JPEG bytes of the 3×3 temporal storyboard grid.
+            jpeg_bytes:   Raw JPEG bytes of the 3×3 temporal storyboard grid.
+            active_rules: PPE rule IDs enabled for this camera (e.g.
+                          ``["hardhat", "vest"]``).  Drives both the prompt
+                          and the response_schema so Gemini can only flag
+                          violations the factory manager cares about.
 
         Returns:
-            A validated ``ViolationAnalysis`` Pydantic model.
+            A validated ``ViolationAnalysis`` Pydantic model (actually an
+            instance of the dynamic subclass returned by
+            ``_build_violation_schema``).
 
         Raises:
             GeminiAPIError: When all retries are exhausted.
@@ -480,25 +627,27 @@ class GeminiClient:
         # never has to guess the format from magic bytes.
         grid_image = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
 
+        prompt = _build_prompt(active_rules)
+        scoped_schema = _build_violation_schema(active_rules)
+
         last_exc: Optional[Exception] = None
         for attempt in range(self._cfg.max_retries + 1):
             try:
                 response = await self._client.aio.models.generate_content(
                     model=self._cfg.model,
-                    contents=[grid_image, _ANALYSIS_PROMPT],
+                    contents=[grid_image, prompt],
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
-                        # ViolationAnalysis is passed as the response_schema;
-                        # the SDK derives a constrained JSON schema from the
-                        # Pydantic model so the model must emit valid structure.
-                        response_schema=ViolationAnalysis,
+                        # Scoped subclass: violation_type is a Literal over
+                        # exactly the labels allowed for this camera.
+                        response_schema=scoped_schema,
                         temperature=self._cfg.temperature,
                     ),
                 )
                 # Double-validate through Pydantic to enforce custom validators
-                # (confidence clamping, None normalisation) that live outside
-                # the JSON schema itself.
-                return ViolationAnalysis.model_validate_json(response.text)
+                # (confidence clamping, None normalisation) plus the dynamic
+                # Literal narrowing on violation_type.
+                return scoped_schema.model_validate_json(response.text)
 
             except Exception as exc:  # noqa: BLE001
                 delay = self._cfg.retry_base_delay * (2 ** attempt)
@@ -691,7 +840,11 @@ class VLMEscalationHandler:
             )
 
             # ── Send to Gemini via SDK (async, non-blocking) ──────────────────
-            analysis: ViolationAnalysis = await self._client.analyse(jpeg_bytes)
+            # active_rules narrows both the prompt and the response_schema so
+            # Gemini cannot hallucinate violations outside the configured set.
+            analysis: ViolationAnalysis = await self._client.analyse(
+                jpeg_bytes, event.active_rules
+            )
 
             # ── Slack alert (fire-and-forget) ─────────────────────────────────
             # Scheduled as a concurrent Task so the blocking file write +

@@ -1,0 +1,48 @@
+# VeoTrex edge deployment — Jetson Orin Nano.
+#
+# Secrets are NEVER hardcoded.  Every credential (Supabase, Slack, Gemini)
+# is loaded at runtime from the sibling `.env` file.  Copy `.env.example`
+# to `.env` on each device and fill it in locally; `.env` is gitignored.
+
+services:
+  veotrex-tracker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: veotrex/tracker:latest
+    container_name: veotrex-tracker
+    restart: unless-stopped
+
+    # ── GPU passthrough ──────────────────────────────────────────────────
+    # `runtime: nvidia` is the classic Jetson / nvidia-docker2 mechanism:
+    # it injects libcudart / libnvinfer / the Tegra device nodes into the
+    # container so the TensorRT engine can execute on the Orin Nano GPU.
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+
+    # ── Secrets + per-camera config (NOT committed) ─────────────────────
+    env_file:
+      - .env
+
+    # ── Volumes ──────────────────────────────────────────────────────────
+    # • ./models        : .engine files built on the device (outside image)
+    # • ./credentials   : Vertex AI service-account JSON (read-only)
+    # • /etc/localtime  : align container logs with host timezone
+    volumes:
+      - ./models:/app/models:ro
+      - ./credentials:/app/credentials:ro
+      - /etc/localtime:/etc/localtime:ro
+
+    # ── Networking ───────────────────────────────────────────────────────
+    # host networking avoids NAT overhead on the RTSP ingest path and lets
+    # the edge box receive multicast camera announcements on the LAN.
+    network_mode: host
+
+    # Container logs → journald so systemd (and `journalctl -u veotrex`)
+    # own the log pipeline on the device.
+    logging:
+      driver: journald
+      options:
+        tag: veotrex

@@ -1,7 +1,15 @@
-ultralytics
-opencv-python
-aiohttp
-google-genai
-pydantic
-dotenv
-numpy
+# Core CV + tracking
+ultralytics>=8.3.0
+opencv-python-headless>=4.9.0.80
+numpy>=1.26.0
+
+# Supabase polling + cloud telemetry
+httpx>=0.27.0
+aiohttp>=3.9.0
+
+# VLM escalation
+google-genai>=0.3.0
+pydantic>=2.7.0
+
+# Slack alerts
+slack_sdk>=3.27.0

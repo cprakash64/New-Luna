@@ -57,6 +57,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 import cv2
+import httpx
 import numpy as np
 from ultralytics import YOLO
 from ultralytics.trackers import BYTETracker
@@ -87,13 +88,13 @@ class StreamConfig:
 
 @dataclass(frozen=True)
 class DetectorConfig:
-    """YOLOv8 inference parameters."""
+    """YOLO11 pose inference parameters (TensorRT on Jetson Orin Nano)."""
 
-    model_path: str = "yolov8s-pose.pt"
+    model_path: str = "yolov11s-pose.engine"
     confidence: float = 0.40
     iou: float = 0.45
-    device: str = "cpu"       # "cuda" | "mps" | "cpu"
-    imgsz: int = 1280
+    device: str = "cuda:0"    # TensorRT engines are CUDA-only
+    imgsz: int = 1280         # MUST match the engine's build-time input size
     person_class_id: int = 0  # COCO class 0 = person
 
 
@@ -112,16 +113,13 @@ class TrackerConfig:
 @dataclass(frozen=True)
 class EventConfig:
     """
-    ROI dwell detection and event pipeline parameters.
+    Dwell detection and event pipeline parameters.
 
-    roi_polygon is a list of (x, y) integer vertex tuples in pixel space
-    that define the closed region of interest.  A sensible default draws a
-    central rectangle — override this for your camera layout.
+    The ROI polygon and PPE ``active_rules`` are no longer defined here —
+    they are fetched per-camera from Supabase by ``ConfigManager`` and hot-
+    reloaded while the pipeline runs.
     """
 
-    roi_polygon: list[tuple[int, int]] = field(
-        default_factory=lambda: [(320, 180), (960, 180), (960, 540), (320, 540)]
-    )
     dwell_frames: int = 45           # consecutive in-ROI frames before trigger
     cooldown_seconds: float = 15.0   # per-ID minimum gap between events
     buffer_maxlen: int = 60          # rolling frame buffer depth
@@ -287,6 +285,10 @@ class Event:
     triggered_at: float
     dwell_frames_at_trigger: int
     jpeg_streams: list[io.BytesIO]
+    # PPE rule set active for the source camera at trigger time, as fetched
+    # from Supabase by ConfigManager (e.g. ["hardhat", "vest"]).  Forwarded
+    # to the VLM escalation layer to scope the violation check.
+    active_rules: list[str] = field(default_factory=list)
 
     @property
     def triggered_at_str(self) -> str:
@@ -543,6 +545,142 @@ class FrameReader:
         logger.info("FrameReader stopped.")
 
 
+# ─── Supabase-backed runtime config ──────────────────────────────────────────
+
+
+class ConfigManager:
+    """
+    Fetches per-camera runtime config (ROI polygon + PPE ``active_rules``)
+    from the Supabase ``camera_configs`` table and hot-reloads it every
+    ``poll_interval`` seconds in a daemon thread.
+
+    Schema (Supabase table ``camera_configs``)
+    ──────────────────────────────────────────
+        camera_id     text  primary key
+        roi_polygon   jsonb  -- [[x1,y1],[x2,y2],...]
+        active_rules  jsonb  -- ["hardhat","vest",...]
+
+    Threading model
+    ───────────────
+    The main loop reads ``config_mgr.roi`` and ``config_mgr.active_rules``
+    each frame.  A single background poller replaces these under a
+    ``threading.Lock``; attribute reads return the latest consistent
+    snapshot.  Reference assignment is atomic in CPython so the main loop
+    never observes a partially-constructed ``PolygonROI``.
+    """
+
+    _SUPABASE_URL_ENV = "SUPABASE_URL"
+    _SUPABASE_KEY_ENV = "SUPABASE_SERVICE_KEY"
+
+    def __init__(self, camera_id: str, poll_interval: float = 60.0) -> None:
+        url = os.environ.get(self._SUPABASE_URL_ENV)
+        key = os.environ.get(self._SUPABASE_KEY_ENV)
+        if not url or not key:
+            raise RuntimeError(
+                f"{self._SUPABASE_URL_ENV} and {self._SUPABASE_KEY_ENV} "
+                "must be set in the environment."
+            )
+
+        self._camera_id = camera_id
+        self._poll_interval = poll_interval
+        self._client = httpx.Client(
+            base_url=f"{url.rstrip('/')}/rest/v1",
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Accept": "application/json",
+            },
+            timeout=10.0,
+        )
+
+        self._lock = threading.Lock()
+        self._roi: Optional[PolygonROI] = None
+        self._active_rules: list[str] = []
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        # Initial synchronous fetch — fail fast if the camera is unknown or
+        # Supabase is unreachable, rather than starting the pipeline with no
+        # ROI and discovering the problem 60 s later.
+        self._fetch_and_apply()
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    @property
+    def roi(self) -> "PolygonROI":
+        with self._lock:
+            assert self._roi is not None  # guaranteed by __init__ fetch
+            return self._roi
+
+    @property
+    def active_rules(self) -> list[str]:
+        with self._lock:
+            return list(self._active_rules)
+
+    def start(self) -> "ConfigManager":
+        """Launch the background polling thread (daemon)."""
+        if self._thread is not None:
+            return self
+        self._thread = threading.Thread(
+            target=self._poll_loop, name="ConfigPoller", daemon=True
+        )
+        self._thread.start()
+        logger.info(
+            "ConfigManager polling camera_id=%s every %.0fs.",
+            self._camera_id, self._poll_interval,
+        )
+        return self
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+        self._client.close()
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _fetch_and_apply(self) -> None:
+        """Single REST call → parse → atomic swap of the cached snapshot."""
+        resp = self._client.get(
+            "/camera_configs",
+            params={
+                "camera_id": f"eq.{self._camera_id}",
+                "select": "roi_polygon,active_rules",
+                "limit": 1,
+            },
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        if not rows:
+            raise RuntimeError(
+                f"No camera_configs row for camera_id={self._camera_id!r}."
+            )
+        row = rows[0]
+
+        raw_polygon = row.get("roi_polygon") or []
+        vertices = [(int(v[0]), int(v[1])) for v in raw_polygon]
+        rules = [str(r) for r in (row.get("active_rules") or [])]
+
+        new_roi = PolygonROI(vertices)
+        with self._lock:
+            self._roi = new_roi
+            self._active_rules = rules
+        logger.info(
+            "ConfigManager updated: %d ROI vertices, active_rules=%s",
+            len(vertices), rules,
+        )
+
+    def _poll_loop(self) -> None:
+        # Interruptible sleep: wait() returns True when stop() is called.
+        while not self._stop_event.wait(self._poll_interval):
+            try:
+                self._fetch_and_apply()
+            except Exception as exc:  # noqa: BLE001 — poll must never die
+                logger.warning(
+                    "ConfigManager poll failed (keeping last config): %s", exc
+                )
+
+
 # ─── Polygon Region of Interest ──────────────────────────────────────────────
 
 
@@ -590,7 +728,7 @@ class PolygonROI:
 
 class PersonDetector:
     """
-    Wraps Ultralytics YOLOv8 Nano.
+    Wraps Ultralytics YOLO11s-Pose running as a TensorRT engine on Jetson.
 
     Filters to the *person* class only and returns a ``Detections`` container
     whose attributes satisfy ``BYTETracker.update()``'s contract.
@@ -601,7 +739,15 @@ class PersonDetector:
         logger.info(
             "Loading model '%s' on device='%s' …", config.model_path, config.device
         )
-        self._model = YOLO(config.model_path)
+        # task='pose' is required when loading a serialized TensorRT .engine:
+        # the Ultralytics loader cannot always recover the task head from engine
+        # metadata, and without it will silently initialise as a detect model,
+        # leaving results[0].keypoints == None.
+        is_engine = str(config.model_path).lower().endswith(".engine")
+        self._model = (
+            YOLO(config.model_path, task="pose") if is_engine
+            else YOLO(config.model_path)
+        )
         self._warmup()
 
     def _warmup(self) -> None:
@@ -628,8 +774,8 @@ class PersonDetector:
 
         Multi-model data flow — Stage 1: Inference
         ───────────────────────────────────────────
-        YOLOv8s-Pose runs a single forward pass on the full frame and jointly
-        predicts:
+        YOLO11s-Pose (TensorRT engine) runs a single forward pass on the full
+        frame and jointly predicts:
           • Bounding boxes  → results[0].boxes   (used by BYTETracker)
           • 17 COCO keypoints per person → results[0].keypoints
             Shape: (N, 17, 3) where the last axis is [x_px, y_px, confidence].
@@ -876,6 +1022,7 @@ class EventManager:
         entity: TrackedEntity,
         frame_buffer: FrameBuffer,
         now: float,
+        active_rules: Optional[list[str]] = None,
     ) -> bool:
         """
         Check whether *entity* should fire an event this frame.
@@ -914,7 +1061,10 @@ class EventManager:
         snapshot: list[np.ndarray] = frame_buffer.snapshot()
 
         asyncio.run_coroutine_threadsafe(
-            self._process_event(entity.track_id, dwell_count, snapshot, now),
+            self._process_event(
+                entity.track_id, dwell_count, snapshot, now,
+                list(active_rules) if active_rules else [],
+            ),
             self._loop,
         )
         logger.info(
@@ -939,6 +1089,7 @@ class EventManager:
         dwell_frames: int,
         snapshot: list[np.ndarray],
         triggered_at: float,
+        active_rules: list[str],
     ) -> None:
         """
         Async coroutine: encode JPEG snapshots then dispatch the Event.
@@ -958,6 +1109,7 @@ class EventManager:
             triggered_at=triggered_at,
             dwell_frames_at_trigger=dwell_frames,
             jpeg_streams=jpeg_streams,
+            active_rules=active_rules,
         )
 
         # Support both plain sync callbacks and async callables transparently.
@@ -1398,6 +1550,7 @@ def run(
     detector_cfg: DetectorConfig,
     tracker_cfg: TrackerConfig,
     event_cfg: EventConfig,
+    config_mgr: ConfigManager,
     on_event: Optional[Callable[[Event], None]] = None,
     display: bool = False,
 ) -> None:
@@ -1429,13 +1582,13 @@ def run(
     tracker   = PersonTracker(tracker_cfg)
     fps_ctr   = FPSCounter(window=30)
     buf       = FrameBuffer(maxlen=event_cfg.buffer_maxlen)
-    roi       = PolygonROI(event_cfg.roi_polygon)
     registry  = EntityRegistry()
     event_mgr = EventManager(event_cfg, on_event=on_event)
+    config_mgr.start()
 
     logger.info(
-        "Pipeline running.  ROI vertices: %s  dwell=%d frames  cooldown=%.0f s",
-        event_cfg.roi_polygon,
+        "Pipeline running.  dwell=%d frames  cooldown=%.0f s  "
+        "(ROI + active_rules pulled from Supabase)",
         event_cfg.dwell_frames,
         event_cfg.cooldown_seconds,
     )
@@ -1449,6 +1602,12 @@ def run(
                 continue
 
             now = time.time()
+
+            # Pull the latest ROI + PPE rule set from Supabase cache.  Both
+            # may have just been swapped by the ConfigManager poll thread;
+            # reading through the property is lock-guarded.
+            roi = config_mgr.roi
+            active_rules = config_mgr.active_rules
 
             # ── 1. Detect (Stage 1 — YOLOv8s-Pose inference) ─────────────────
             # Produces bounding boxes AND (N, 17, 3) keypoint arrays in one
@@ -1494,7 +1653,7 @@ def run(
             # ── 5. Evaluate event conditions ──────────────────────────────────
             triggered: list[int] = []
             for entity in registry.active_entities(active_ids):
-                if event_mgr.maybe_trigger(entity, buf, now):
+                if event_mgr.maybe_trigger(entity, buf, now, active_rules):
                     triggered.append(entity.track_id)
 
             # ── 6. Prune old entities ─────────────────────────────────────────
@@ -1534,6 +1693,7 @@ def run(
     finally:
         reader.stop()
         event_mgr.shutdown()
+        config_mgr.stop()
         # If the caller passed a VLMEscalationHandler (or any handler with a
         # close_sync() hook), give it a chance to drain in-flight async work
         # and close network connections before the process exits.
@@ -1581,14 +1741,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ── Event ─────────────────────────────────────────────────────────────────
     p.add_argument(
-        "--roi",
-        default=None,
-        metavar="JSON",
+        "--camera-id",
+        required=True,
         help=(
-            "Polygon ROI as a JSON array of [x,y] pairs, e.g. "
-            "'[[100,200],[800,200],[800,600],[100,600]]'.  "
-            "Defaults to a centre-frame rectangle."
+            "Supabase camera_configs.camera_id whose roi_polygon and "
+            "active_rules drive this tracker instance."
         ),
+    )
+    p.add_argument(
+        "--config-poll-interval", type=float, default=60.0, metavar="SEC",
+        help="How often ConfigManager re-queries Supabase for ROI/rule updates",
     )
     p.add_argument(
         "--dwell-frames", type=int, default=45,
@@ -1624,16 +1786,10 @@ def main() -> None:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Parse optional ROI polygon from JSON
-    roi_polygon: list[tuple[int, int]]
-    if args.roi:
-        try:
-            raw = json.loads(args.roi)
-            roi_polygon = [(int(v[0]), int(v[1])) for v in raw]
-        except (json.JSONDecodeError, (IndexError, TypeError, ValueError)) as exc:
-            raise SystemExit(f"Invalid --roi JSON: {exc}") from exc
-    else:
-        roi_polygon = [(320, 180), (960, 180), (960, 540), (320, 540)]
+    config_mgr = ConfigManager(
+        camera_id=args.camera_id,
+        poll_interval=args.config_poll_interval,
+    )
 
     run(
         stream_cfg=StreamConfig(
@@ -1657,13 +1813,13 @@ def main() -> None:
             match_thresh=args.match_thresh,
         ),
         event_cfg=EventConfig(
-            roi_polygon=roi_polygon,
             dwell_frames=args.dwell_frames,
             cooldown_seconds=args.cooldown,
             buffer_maxlen=args.buffer_len,
             snapshot_count=args.snapshots,
             jpeg_quality=args.jpeg_quality,
         ),
+        config_mgr=config_mgr,
         display=args.display,
     )
 
@@ -1724,15 +1880,19 @@ if __name__ == "__main__":
         
         print(f"\n--- LOADING VIDEO: {_CURRENT_VIDEO} ---\n")
 
+        # Local test runs still need a camera_id in Supabase; override via
+        # the CAMERA_ID env var.  ROI + active_rules come from that row.
+        _test_camera_id = os.environ.get("CAMERA_ID", "local-test")
+
         run(
             stream_cfg=StreamConfig(rtsp_url=_CURRENT_VIDEO), # <-- Make sure this says _CURRENT_VIDEO
             detector_cfg=DetectorConfig(),
             tracker_cfg=TrackerConfig(),
             event_cfg=EventConfig(
-                roi_polygon=[(0, 0), (1920, 0), (1920, 1080), (0, 1080)],
                 dwell_frames=5,
                 snapshot_count=5,
             ),
+            config_mgr=ConfigManager(camera_id=_test_camera_id),
             on_event=_vlm_handler,
             display=True,
         )
